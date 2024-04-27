@@ -33,6 +33,7 @@ contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
     error TeachingContract__NotAcceptingEnrollment();
     error TeachingContract__WrongKey();
     error TeachingContract__NotAStudent();
+    error TeachingContract__UpkeepNotNeeded();
 
     /* Type Declarations */
     enum Enrollment {
@@ -51,17 +52,19 @@ contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
     VRFCoordinatorV2Interface private immutable i_vrfCoordinator;
     uint64 private immutable i_subscriptionId;
     bytes32 private immutable i_gasLane;
-    uint32 private immutable i_callbackGaaLimit;
+    uint32 private immutable i_callbackGasLimit;
 
     //Classroom variables
     uint256 private constant TUITIONFEE = 0.1 ether;
-    uint256 private constant PENALTY = 10;
+    uint8 private constant PENALTY = 10;
     address private immutable i_owner;
-    uint256 private immutable i_interval;
     address payable private s_studentAddress;
     uint8 private s_week;
-    uint256 private s_studentBalance;
-    bytes32 private s_classroomKey;
+    uint8 private s_studentBalance;
+    uint256 private s_interval;
+    uint256 private s_studentPayout;
+    uint256 private s_classroomKey;
+    uint256 private s_previousLessonTime;
     Attendance private s_studentAttendance;
     Enrollment private s_takingStudents;
 
@@ -70,8 +73,7 @@ contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
     event StudentEnrolled(address indexed student);
     event StudentAttendedClass(address indexed student);
 
-    /* Modifiers */
-    modifier onlyOwner() {
+    /* Modifiers */ modifier onlyOwner() {
         if (msg.sender != i_owner) {
             revert TeachingContract__NotOwner();
         }
@@ -83,7 +85,7 @@ contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
         }
         _;
     }
-    modifier classroomLock(bytes32 key) {
+    modifier classroomLock(uint256 key) {
         if (key != s_classroomKey) {
             revert TeachingContract__WrongKey();
         }
@@ -99,31 +101,41 @@ contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
     /* Functions */
     constructor(
         uint64 subscriptionId,
-        uint8 numWeeks,
         bytes32 gasLane,
-        uint256 interval,
-        uint256 entranceFee,
         uint32 callbackGasLimit,
         address vrfCoordinator
     ) VRFConsumerBaseV2(vrfCoordinator) {
-        s_week = numWeeks;
         i_owner = msg.sender;
         i_vrfCoordinator = VRFCoordinatorV2Interface(vrfCoordinator);
         i_gasLane = gasLane;
-        i_interval = interval;
         i_subscriptionId = subscriptionId;
+        i_callbackGasLimit = callbackGasLimit;
     }
 
     /* */
 
-    function enroll() external payable checkEnrollment {
+    function enroll(
+        uint8 duration,
+        uint8 interval
+    ) external payable checkEnrollment {
         if (msg.value < TUITIONFEE) {
             revert TeachingContract__InsufficientTuition();
         }
         s_studentAddress = payable(msg.sender);
         s_studentBalance = 200;
         s_takingStudents = Enrollment.FULL;
-        //Interactions: Spin off the automation
+        s_interval = interval;
+        s_week = duration;
+        s_previousLessonTime = block.timestamp;
+        //Programatically register an upkeep and start automation
+    }
+
+    function enterClassroom(
+        uint256 key
+    ) external checkEnrollment onlyStudent classroomLock(key) {
+        s_studentAttendance = Attendance.PRESENT;
+
+        emit StudentAttendedClass(msg.sender);
     }
 
     /**
@@ -142,13 +154,54 @@ contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
         override
         returns (bool upkeepNeeded, bytes memory /*performData*/)
     {
-        upkeepNeeded = true;
+        bool enoughTimeElasped = (block.timestamp - s_previousLessonTime) >
+            s_interval;
+        bool studentAttendingClass = s_takingStudents == Enrollment.FULL;
+        bool keyExists = s_classroomKey != 0;
+        bool classStillOn = s_week != 0;
+        upkeepNeeded =
+            enoughTimeElasped &&
+            studentAttendingClass &&
+            keyExists &&
+            classStillOn;
         return (upkeepNeeded, "0x0");
     }
 
+    /**
+     * Weekly automation to check if the student showed up this week
+     */
     function performUpkeep(bytes calldata /* performData */) external override {
-        //If class was attended
-        if (s_studentAttendance == Attendance.PRESENT) {}
+        (bool upkeepNeeded, ) = checkUpkeep("");
+        //If it's the final week of the contract then we want to stop upkeep
+        if (!upkeepNeeded) {
+            revert TeachingContract__UpkeepNotNeeded();
+        }
+        if (s_week == 0) {
+            address payable alumni = s_studentAddress;
+            //Reset contract to default state
+            s_studentAddress = payable(0);
+            s_takingStudents = Enrollment.ACCEPTING;
+            s_studentPayout = s_studentBalance;
+            s_studentBalance = 0;
+            s_classroomKey = 0;
+
+            //TODO: cancel upkeep
+            //return remaining tuition
+            (bool success, ) = alumni.call{value: address(this).balance}("");
+            if (!success) {
+                revert();
+            }
+            return;
+        }
+        //If class was not attended: apply penalities
+        if (s_studentAttendance == Attendance.ABSENT) {
+            s_studentBalance -= PENALTY;
+        }
+        s_studentAttendance = Attendance.ABSENT;
+        s_week -= 1;
+        //Generate Key for next week
+
+        return;
     }
 
     /* Should be called by perform upkeep function in order to subtract from the student balance
@@ -156,11 +209,11 @@ contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
      */
 
     function fulfillRandomWords(
-        uint256 requestId,
+        uint256 /* requestId*/,
         uint256[] memory randomWords
     ) internal override {
         //generate the key and save it
-        s_classroomKey = keccak256(abi.encodePacked(randomWords[0]));
+        s_classroomKey = randomWords[0];
     }
 
     function checkAttendance() private {}
@@ -174,6 +227,14 @@ contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
         return s_studentAddress;
     }
 
+    function getWeeksRemaining() public view returns (uint8) {
+        return s_week;
+    }
+
+    function getStudentBalance() public view returns (uint8) {
+        return s_studentBalance;
+    }
+
     function getAttendance() public view returns (Attendance) {
         return s_studentAttendance;
     }
@@ -182,7 +243,11 @@ contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
         return s_takingStudents;
     }
 
-    function getClassroomKey() public view onlyOwner returns (bytes32) {
+    function getPreviousLessonTime() public view returns (uint256) {
+        return s_previousLessonTime;
+    }
+
+    function getClassroomKey() public view onlyOwner returns (uint256) {
         return s_classroomKey;
     }
 }
