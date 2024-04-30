@@ -25,6 +25,26 @@ pragma solidity ^0.8.25;
 import {VRFCoordinatorV2Interface} from "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
 import {VRFConsumerBaseV2} from "@chainlink/contracts/src/v0.8/VRFConsumerBaseV2.sol";
 import {AutomationCompatibleInterface} from "@chainlink/contracts/src/v0.8/interfaces/AutomationCompatibleInterface.sol";
+import {LinkTokenInterface} from "@chainlink/contracts/src/v0.8/interfaces/LinkTokenInterface.sol";
+
+struct RegistrationParams {
+    string name;
+    bytes encryptedEmail;
+    address upkeepContract;
+    uint32 gasLimit;
+    address adminAddress;
+    uint8 triggerType;
+    bytes checkData;
+    bytes triggerConfig;
+    bytes offchainConfig;
+    uint96 amount;
+}
+
+interface AutomationRegistrarInterface {
+    function registerUpkeep(
+        RegistrationParams calldata requestParams
+    ) external returns (uint256);
+}
 
 contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
     /* Errors */
@@ -53,6 +73,11 @@ contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
     uint64 private immutable i_subscriptionId;
     bytes32 private immutable i_gasLane;
     uint32 private immutable i_callbackGasLimit;
+
+    //AutomationRegistrar
+    LinkTokenInterface private immutable i_link;
+    AutomationRegistrarInterface private immutable i_registrar;
+    RegistrationParams private s_params;
 
     //Classroom variables
     uint256 private constant TUITIONFEE = 0.1 ether;
@@ -103,16 +128,20 @@ contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
         uint64 subscriptionId,
         bytes32 gasLane,
         uint32 callbackGasLimit,
-        address vrfCoordinator
+        RegistrationParams memory params,
+        address vrfCoordinator,
+        address linkAddress,
+        address registrarAddress
     ) VRFConsumerBaseV2(vrfCoordinator) {
         i_owner = msg.sender;
+        i_link = LinkTokenInterface(linkAddress);
+        i_registrar = AutomationRegistrarInterface(registrarAddress);
+        s_params = params;
         i_vrfCoordinator = VRFCoordinatorV2Interface(vrfCoordinator);
         i_gasLane = gasLane;
         i_subscriptionId = subscriptionId;
         i_callbackGasLimit = callbackGasLimit;
     }
-
-    /* */
 
     function enroll(
         uint8 duration,
@@ -177,20 +206,8 @@ contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
             revert TeachingContract__UpkeepNotNeeded();
         }
         if (s_week == 0) {
-            address payable alumni = s_studentAddress;
-            //Reset contract to default state
-            s_studentAddress = payable(0);
-            s_takingStudents = Enrollment.ACCEPTING;
-            s_studentPayout = s_studentBalance;
-            s_studentBalance = 0;
-            s_classroomKey = 0;
-
-            //TODO: cancel upkeep
-            //return remaining tuition
-            (bool success, ) = alumni.call{value: address(this).balance}("");
-            if (!success) {
-                revert();
-            }
+            resetContractState();
+            cancelUpKeep();
             return;
         }
         //If class was not attended: apply penalities
@@ -200,8 +217,14 @@ contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
         s_studentAttendance = Attendance.ABSENT;
         s_week -= 1;
         //Generate Key for next week
-
-        return;
+        uint256 requestId = i_vrfCoordinator.requestRandomWords(
+            i_gasLane,
+            i_subscriptionId,
+            REQUEST_CONFIRMATIONS,
+            i_callbackGasLimit,
+            NUM_WORDS
+        );
+        emit CheckedAttendance(requestId);
     }
 
     /* Should be called by perform upkeep function in order to subtract from the student balance
@@ -216,7 +239,24 @@ contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
         s_classroomKey = randomWords[0];
     }
 
-    function checkAttendance() private {}
+    function cancelUpKeep() internal {}
+
+    function resetContractState() internal {
+        address payable alumni = s_studentAddress;
+        //Reset contract to default state
+        s_studentAddress = payable(0);
+        s_takingStudents = Enrollment.ACCEPTING;
+        s_studentPayout = s_studentBalance;
+        s_studentBalance = 0;
+        s_classroomKey = 0;
+
+        //TODO: cancel upkeep
+        //return remaining tuition
+        (bool success, ) = alumni.call{value: address(this).balance}("");
+        if (!success) {
+            revert();
+        }
+    }
 
     /**Getters */
     function getOwner() public view returns (address) {
