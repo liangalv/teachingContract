@@ -44,6 +44,8 @@ interface AutomationRegistrarInterface {
     function registerUpkeep(
         RegistrationParams calldata requestParams
     ) external returns (uint256);
+
+    function cancelUpkeep(uint256 upkeepId) external;
 }
 
 contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
@@ -78,6 +80,7 @@ contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
     LinkTokenInterface private immutable i_link;
     AutomationRegistrarInterface private immutable i_registrar;
     RegistrationParams private s_params;
+    uint256 private s_upkeepId;
 
     //Classroom variables
     uint256 private constant TUITIONFEE = 0.1 ether;
@@ -97,6 +100,7 @@ contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
     event CheckedAttendance(uint256 indexed requestId);
     event StudentEnrolled(address indexed student);
     event StudentAttendedClass(address indexed student);
+    event UpkeepRegistered(uint256 indexed upkeepId);
 
     /* Modifiers */ modifier onlyOwner() {
         if (msg.sender != i_owner) {
@@ -157,6 +161,7 @@ contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
         s_week = duration;
         s_previousLessonTime = block.timestamp;
         //Programatically register an upkeep and start automation
+        approveAndRegisterUpkeep();
     }
 
     function enterClassroom(
@@ -240,6 +245,19 @@ contract TeachingContract is VRFConsumerBaseV2, AutomationCompatibleInterface {
     }
 
     function cancelUpKeep() internal {}
+
+    function approveAndRegisterUpkeep() internal {
+        //Link must be approved for transfer: either done everytime or done once with infinite approval
+        i_link.approve(address(i_registrar), s_params.amount);
+        uint256 upkeepId = i_registrar.registerUpkeep(s_params);
+
+        if (upkeepId != 0) {
+            s_upkeepId = upkeepId;
+        } else {
+            revert("Auto approve disabled");
+        }
+        emit UpkeepRegistered(upkeepId);
+    }
 
     function resetContractState() internal {
         address payable alumni = s_studentAddress;
